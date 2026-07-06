@@ -1,0 +1,149 @@
+name: 'GHCR 健壮推送 (ghcr-push)'
+description: >-
+  把本地 registry 的 ci-<sha> 中转镜像 retag 后稳健推送到 GHCR。
+  为内网 local 机 ~1MB/s 上行设计：宿主级 flock 串行（同一时刻只有一个 push 独占上行）
+  + 指数退避自动重试 + 已存在层被 registry 跳过（= 断点续传，重试只补传中断的那一层）。
+  取代各仓库 publish job 里裸奔的 `docker push`，根治「推送超时红 / 多仓库同时推双红 / 手动 rerun」。
+
+inputs:
+  image:
+    description: 'GHCR 目标镜像（不含 tag），如 ghcr.io/birditch-dev/fairdesk-bot'
+    required: true
+  src:
+    description: '源镜像（本地 registry 的 ci-<sha> 中转），如 127.0.0.1:10000/fairdesk-bot:ci-<full-sha>'
+    required: true
+  token:
+    description: 'GHCR 登录令牌，传 secrets.GITHUB_TOKEN'
+    required: true
+  extra-tags:
+    description: '逗号分隔的额外 tag（除短 SHA 外）。默认 latest。传空串则不加 latest。'
+    required: false
+    default: 'latest'
+  short-sha:
+    description: '是否额外 retag+push 7 位短 SHA（沿用组织既有标签惯例 / ghcr-cleanup 保留策略）'
+    required: false
+    default: 'true'
+  username:
+    description: 'GHCR 登录用户名'
+    required: false
+    default: ${{ github.actor }}
+  registry:
+    description: '目标 registry 主机'
+    required: false
+    default: 'ghcr.io'
+  retries:
+    description: '单个 tag push 的最大尝试次数（含首次）'
+    required: false
+    default: '6'
+  max-backoff:
+    description: '指数退避单次上限（秒）'
+    required: false
+    default: '60'
+  lock-file:
+    description: '宿主级 flock 互斥文件（须挂在所有 runner 的共享卷；缺失则自动降级为无串行、仅重试）'
+    required: false
+    default: '/ci-locks/ghcr.lock'
+  lock-timeout:
+    description: 'flock 抢锁等待上限（秒）；超时按一次失败计入重试'
+    required: false
+    default: '3600'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 稳健推送 GHCR（flock 串行 + 指数退避 + 断点续传）
+      shell: bash
+      env:
+        IN_IMAGE: ${{ inputs.image }}
+        IN_SRC: ${{ inputs.src }}
+        IN_TOKEN: ${{ inputs.token }}
+        IN_EXTRA_TAGS: ${{ inputs.extra-tags }}
+        IN_SHORT_SHA: ${{ inputs.short-sha }}
+        IN_USER: ${{ inputs.username }}
+        IN_REGISTRY: ${{ inputs.registry }}
+        IN_RETRIES: ${{ inputs.retries }}
+        IN_MAX_BACKOFF: ${{ inputs.max-backoff }}
+        IN_LOCK: ${{ inputs.lock-file }}
+        IN_LOCK_TIMEOUT: ${{ inputs.lock-timeout }}
+      run: |
+        set -euo pipefail
+
+        [ -n "$IN_IMAGE" ] || { echo "::error::image 输入不能为空"; exit 1; }
+        [ -n "$IN_SRC" ]   || { echo "::error::src 输入不能为空"; exit 1; }
+
+        # ── 登录 GHCR（token 由 GITHUB_TOKEN 自动脱敏）───────────────────────────
+        echo "$IN_TOKEN" | docker login "$IN_REGISTRY" -u "$IN_USER" --password-stdin
+
+        # ── 源镜像就位：image job 同机构建通常已在宿主 daemon；否则从本地 registry 拉 ──
+        if ! docker image inspect "$IN_SRC" >/dev/null 2>&1; then
+          echo "本地 daemon 无 ${IN_SRC}，从本地 registry 拉取…"
+          docker pull "$IN_SRC"
+        fi
+
+        # ── flock 前置：锁目录须由共享卷提供；缺失则降级为无宿主级串行（仍逐层重试）──
+        LOCK_ENABLED=1
+        lock_dir=$(dirname "$IN_LOCK")
+        if command -v flock >/dev/null 2>&1 && [ -d "$lock_dir" ]; then
+          : > "$IN_LOCK" 2>/dev/null || true
+          [ -e "$IN_LOCK" ] || LOCK_ENABLED=0
+        else
+          LOCK_ENABLED=0
+        fi
+        if [ "$LOCK_ENABLED" = 1 ]; then
+          echo "宿主级串行：已启用（flock ${IN_LOCK}，等待上限 ${IN_LOCK_TIMEOUT}s）"
+        else
+          echo "::warning::宿主级串行未启用（锁目录 $lock_dir 不存在或无 flock）——降级为仅重试；如需根治多仓库同时推挤爆上行，请给 runner 挂载 ci-locks 共享卷"
+        fi
+
+        # ── 单 ref 推送：flock 独占上行 + 指数退避重试；已存在层被 registry 跳过=断点续传 ──
+        push_one() {
+          local ref="$1" attempt=1 rc=0 backoff
+          while :; do
+            echo "→ push ${ref}（第 ${attempt}/${IN_RETRIES} 次尝试）"
+            if [ "$LOCK_ENABLED" = 1 ]; then
+              # 每次尝试独立抢锁：退避 sleep 期间释放锁，把上行让给其他排队 job
+              if flock -w "$IN_LOCK_TIMEOUT" "$IN_LOCK" docker push "$ref"; then return 0; fi
+              rc=$?
+            else
+              if docker push "$ref"; then return 0; fi
+              rc=$?
+            fi
+            if [ "$attempt" -ge "$IN_RETRIES" ]; then
+              echo "::error::push ${ref} 失败：已达最大重试 ${IN_RETRIES} 次（最后退出码 ${rc}）"
+              return 1
+            fi
+            backoff=$(( 2 ** attempt ))
+            [ "$backoff" -gt "$IN_MAX_BACKOFF" ] && backoff="$IN_MAX_BACKOFF"
+            echo "::warning::push ${ref} 第 ${attempt} 次失败（退出码 ${rc}），${backoff}s 后重试；已上传层将自动跳过（断点续传）"
+            sleep "$backoff"
+            attempt=$(( attempt + 1 ))
+          done
+        }
+
+        # ── 组装 tag 列表：extra-tags（默认 latest）+ 可选短 SHA ──────────────────
+        declare -a TAGS=()
+        IFS=',' read -ra _ext <<< "${IN_EXTRA_TAGS:-}"
+        for t in "${_ext[@]}"; do
+          t="$(echo "$t" | xargs)"   # trim 首尾空白
+          [ -n "$t" ] && TAGS+=("$t")
+        done
+        if [ "$IN_SHORT_SHA" = "true" ]; then
+          TAGS+=("${GITHUB_SHA:0:7}")
+        fi
+        [ "${#TAGS[@]}" -gt 0 ] || { echo "::error::没有任何 tag 可推（extra-tags 为空且 short-sha=false）"; exit 1; }
+
+        # ── retag（本地，无上行）→ 逐 tag 串行 push ────────────────────────────
+        # 首个 tag 完成后，同镜像其余 tag 的层已全在 GHCR，仅传 manifest，近乎瞬时。
+        {
+          echo "## GHCR 发布（健壮推送）"
+          echo ""
+          echo "| 镜像 | 标签 |"
+          echo "|------|------|"
+        } >> "$GITHUB_STEP_SUMMARY"
+        for t in "${TAGS[@]}"; do
+          dst="$IN_IMAGE:$t"
+          docker tag "$IN_SRC" "$dst"
+          push_one "$dst"
+          echo "| \`$IN_IMAGE\` | \`$t\` |" >> "$GITHUB_STEP_SUMMARY"
+        done
+        echo "已推送 ${#TAGS[@]} 个 tag 到 $IN_IMAGE"
